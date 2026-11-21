@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+{% block head %}{% if not job.done %}<meta http-equiv="refresh" content="2">{% endif %}{% endblock %}
+{% block content %}
+<h1>任务 {{ job.id }}
+  <span class="badge {{ 'b-done' if job.done else 'b-run' }}">{{ phase }}</span>
+</h1>
+
+<div class="card">
+  <h2>进度</h2>
+  <p>Map：{{ maps_done }}/{{ job.files|length }} 个文件 &nbsp;·&nbsp;
+     Reduce：{{ reduces_done }}/{{ job.r }} 个分区</p>
+  <h2>工作进程（可在归并途中停掉一个，丢失分片由幸存进程补算）</h2>
+  <table>
+    <tr><th>ID</th><th>状态</th><th>本任务持有的完好分片</th><th>操作</th></tr>
+    {% for wid, w in workers.items() %}
+    <tr>
+      <td>{{ wid }}</td>
+      <td><span class="badge {{ 'b-ok' if w.state == 'ALIVE' else 'b-dead' }}">{{ w.state }}</span></td>
+      <td>{{ shard_count.get(wid, 0) }}</td>
+      <td>
+        <form method="post" action="/jobs/{{ job.id }}/kill/{{ wid }}"
+              onsubmit="return confirm('停掉 {{ wid }}？其分片将由幸存进程从原文件补算')">
+          <button class="danger" {% if w.state != 'ALIVE' or job.done %}disabled{% endif %}>
+            停掉 {{ wid }}</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+
+<div class="card">
+  <h2>Map 任务</h2>
+  <table>
+    <tr><th>文件</th><th>状态</th><th>epoch</th><th>执行者</th><th>记录数</th></tr>
+    {% for fid, m in maps %}
+    <tr><td>{{ files[fid].name }}</td><td>{{ m.state }}</td><td>{{ m.epoch }}</td>
+        <td>{{ m.worker or '' }}</td><td>{{ m.records }}</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+<div class="card">
+  <h2>中间分片（绿=完好复用，红=丢失待补算，灰=未生成；字母=所在进程）</h2>
+  <table>
+    <tr><th>文件 \ 分区</th>{% for p in parts %}<th>{{ p }}</th>{% endfor %}</tr>
+    {% for fid in job.files %}
+    <tr>
+      <td>{{ files[fid].name }}</td>
+      {% for cell in grid[fid] %}
+      {% if cell is none %}
+      <td class="c cell-none">–</td>
+      {% else %}
+      <td class="c {{ 'cell-ok' if cell.status == 'OK' else 'cell-lost' }}"
+          title="{{ cell.worker }} / epoch {{ cell.epoch }}">{{ cell.worker[-1] }}</td>
+      {% endif %}
+      {% endfor %}
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+
+<div class="card">
+  <h2>归并任务</h2>
+  <table>
+    <tr><th>分区</th><th>状态</th><th>epoch</th><th>执行者</th><th>请求数</th></tr>
+    {% for p, rd in reduces %}
+    <tr><td>{{ p }}</td><td>{{ rd.state }}</td><td>{{ rd.epoch }}</td>
+        <td>{{ rd.worker or '' }}</td><td>{{ rd.records }}</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+{% if job.done and job.report %}
+<div class="card">
+  <h2>清单：重试后仍报 5xx 的请求（每个请求以最新记录为准）</h2>
+  <p>共 {{ job.report.total_requests }} 个请求 / {{ job.report.total_records }} 条记录；
+     重试过 {{ job.report.retried }} 个；
+     <b>重试后仍 5xx：{{ job.report.still_5xx|length }} 个</b>；
+     另有 {{ job.report.single_5xx }} 个 5xx 但未重试（不在清单内）。</p>
+  <table>
+    <tr><th>请求号</th><th>尝试次数</th><th>最新状态码</th><th>最新时间戳</th></tr>
+    {% for r in job.report.still_5xx %}
+    <tr><td>{{ r.request_id }}</td><td>{{ r.attempts }}</td>
+        <td>{{ r.latest_status }}</td><td>{{ r.latest_ts }}</td></tr>
+    {% endfor %}
+  </table>
+</div>
+{% else %}
+<p class="muted">全部归并完成后才显示清单。</p>
+{% endif %}
+
+<div class="card">
+  <h2>事件</h2>
+  <div class="events">
+    {% for e in events %}<div>[{{ e.ts }}] {{ e.msg }}</div>{% endfor %}
+  </div>
+</div>
+{% endblock %}

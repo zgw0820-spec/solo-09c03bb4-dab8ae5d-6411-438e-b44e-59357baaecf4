@@ -1,0 +1,48 @@
+services:
+  web:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_DIR: /data
+      HEARTBEAT_TIMEOUT: "10"
+      JOB_PARTITIONS: "8"
+    volumes:
+      - appdata:/data
+
+  worker1:
+    build: .
+    command: ["python", "-m", "app.worker.worker"]
+    environment:
+      WORKER_ID: worker1
+      WORKER_PORT: "8101"
+      COORDINATOR_URL: http://web:8000
+      DATA_DIR: /data
+      SHARD_DIR: /shards
+      REDUCE_DELAY_MS: "500"
+    volumes:
+      - appdata:/data
+    tmpfs:
+      - /shards          # worker-local shard storage: gone when the process stops
+    depends_on:
+      - web
+
+  worker2:
+    build: .
+    command: ["python", "-m", "app.worker.worker"]
+    environment:
+      WORKER_ID: worker2
+      WORKER_PORT: "8102"
+      COORDINATOR_URL: http://web:8000
+      DATA_DIR: /data
+      SHARD_DIR: /shards
+      REDUCE_DELAY_MS: "500"
+    volumes:
+      - appdata:/data
+    tmpfs:
+      - /shards
+    depends_on:
+      - web
+
+volumes:
+  appdata:

@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>代理日志分析：重试后仍报 5xx 的请求</h1>
+
+<div class="card">
+  <h2>1. 上传 CSV（列：request_id,timestamp,status；同一请求的时间戳互异）</h2>
+  <form action="/upload" method="post" enctype="multipart/form-data">
+    <input type="file" name="files" multiple required>
+    <button type="submit">上传</button>
+  </form>
+  {% if files %}
+  <table>
+    <tr><th>文件</th><th>ID</th><th>字节</th><th>上传时间</th></tr>
+    {% for f in files.values() %}
+    <tr><td>{{ f.name }}</td><td>{{ f.id }}</td><td>{{ f.size }}</td><td>{{ f.uploaded }}</td></tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>2. 启动归并任务</h2>
+  {% if files %}
+  <form action="/jobs/start" method="post">
+    {% for fid, f in files.items() %}
+    <label><input type="checkbox" name="file_ids" value="{{ fid }}" checked> {{ f.name }}</label>
+    {% endfor %}
+    <button type="submit">开始分析</button>
+  </form>
+  {% else %}
+  <p class="muted">请先上传文件。</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>工作进程</h2>
+  <table>
+    <tr><th>ID</th><th>状态</th><th>boot</th><th>最近心跳</th><th>已完成任务</th></tr>
+    {% for wid, w in workers.items() %}
+    <tr>
+      <td>{{ wid }}</td>
+      <td><span class="badge {{ 'b-ok' if w.state == 'ALIVE' else 'b-dead' }}">{{ w.state }}</span></td>
+      <td>{{ w.boot_id }}</td>
+      <td>{{ w.hb_age }} 秒前</td>
+      <td>{{ w.tasks_done }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+
+{% if order %}
+<div class="card">
+  <h2>任务</h2>
+  <table>
+    <tr><th>ID</th><th>创建时间</th><th>阶段</th><th></th></tr>
+    {% for jid in order %}
+    <tr>
+      <td><a href="/jobs/{{ jid }}">{{ jid }}</a></td>
+      <td>{{ jobs[jid].created }}</td>
+      <td><span class="badge {{ 'b-done' if phase[jid] == 'COMPLETE' else 'b-run' }}">{{ phase[jid] }}</span></td>
+      <td><a href="/jobs/{{ jid }}">查看</a></td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+
+<div class="card">
+  <form action="/reset" method="post"
+        onsubmit="return confirm('清空全部文件与任务？')">
+    <button class="danger" type="submit">清空全部数据</button>
+  </form>
+</div>
+{% endblock %}
