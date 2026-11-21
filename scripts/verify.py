@@ -80,18 +80,6 @@ def wait_done(jid, timeout=240, on_status=None):
     raise TimeoutError(f"job {jid} not done within {timeout}s")
 
 
-def pick_victim(st, maps):
-    """A live worker that holds at least one file's shards; prefer worker1."""
-    holders = {}
-    for fid, w in maps.items():
-        if w:
-            holders.setdefault(w, set()).add(fid)
-    for cand in sorted(holders):
-        if st["workers"].get(cand, {}).get("state") == "ALIVE":
-            return cand, holders[cand]
-    return None, set()
-
-
 def main() -> int:
     print(f"== 0. 等待服务 {BASE}")
     for _ in range(60):
@@ -140,11 +128,22 @@ def main() -> int:
             return
         assigned = sum(1 for rd in st["reduces"].values()
                        if rd["state"] == "ASSIGNED")
-        if assigned >= 2:  # both workers mid-merge
-            victim, vfiles = pick_victim(st, kill["maps"])
-            if victim:
+        # kill while the OTHER worker is past the read window (merging), so
+        # its invalidated merge still finishes and its late commit is rejected
+        merging = {rd["worker"] for rd in st["reduces"].values()
+                   if rd["state"] == "ASSIGNED"
+                   and (rd.get("progress") or {}).get("stage") == "merging"}
+        if assigned >= 2 and merging:
+            survivor = sorted(merging)[0]
+            cands = [w for w in sorted(set(kill["maps"].values()))
+                     if w != survivor
+                     and st["workers"].get(w, {}).get("state") == "ALIVE"]
+            if cands:
+                victim = cands[0]
                 http("POST", f"/api/jobs/{job_b}/kill/{victim}", expect=200)
-                kill.update(done=True, victim=victim, vfiles=vfiles)
+                kill.update(done=True, victim=victim,
+                            vfiles={fid for fid, w in kill["maps"].items()
+                                    if w == victim})
 
     st_b = wait_done(job_b, on_status=watch)
     rep_b = st_b["report"]
@@ -164,8 +163,8 @@ def main() -> int:
           "rejected late reduce commit" in events)
     recomputed = {fid for fid, m in st_b["maps"].items() if m["epoch"] > 1}
     check("只补算掉线进程的分片，幸存进程的完好分片全部复用",
-          kill["done"] and recomputed == kill["vfiles"],
-          f"recomputed={sorted(recomputed)} victim's={sorted(kill['vfiles'])}")
+          kill["done"] and recomputed == kill.get("vfiles"),
+          f"recomputed={sorted(recomputed)} victim's={sorted(kill.get('vfiles', []))}")
     check("B 清单 == A 清单（掉线后结果一致）",
           rep_b["still_5xx"] == rep_a["still_5xx"],
           f"{len(rep_b['still_5xx'])} vs {len(rep_a['still_5xx'])}")

@@ -29,6 +29,9 @@ COORD = os.environ.get("COORDINATOR_URL", "http://localhost:8000")
 SHARD_DIR = os.environ.get("SHARD_DIR", f"/tmp/shards-{WORKER_ID}")
 BASE_URL = os.environ.get("WORKER_BASE_URL", f"http://{WORKER_ID}:{PORT}")
 REDUCE_DELAY = float(os.environ.get("REDUCE_DELAY_MS", "0")) / 1000.0
+# simulated shard-read latency ("读取受阻"), so the job page can show which
+# file's shard is being read and which worker serves it
+FETCH_DELAY = float(os.environ.get("FETCH_DELAY_MS", "0")) / 1000.0
 BOOT_ID = uuid.uuid4().hex[:12]
 
 app = FastAPI(title=f"worker {WORKER_ID}")
@@ -63,6 +66,22 @@ def control_status():
 
 
 # ------------------------------------------------------------------- tasks
+
+def report_progress(client: httpx.Client, jid: str, part: int, epoch: int,
+                    stage: str, file_id: str | None = None,
+                    source: str | None = None) -> None:
+    """Best-effort reduce-progress report. The merge must go on even when
+    the coordinator cannot be told - progress is for the job page only."""
+    try:
+        client.post(
+            f"{COORD}/api/tasks/reduce-progress/{WORKER_ID}",
+            json={"job_id": jid, "partition": part, "epoch": epoch,
+                  "boot_id": BOOT_ID, "stage": stage,
+                  "file_id": file_id, "source": source},
+            timeout=3)
+    except httpx.HTTPError:
+        pass
+
 
 def do_map(task: dict, client: httpx.Client) -> None:
     jid, fid, epoch, r = task["job_id"], task["file_id"], task["epoch"], task["r"]
@@ -102,6 +121,10 @@ def do_reduce(task: dict, client: httpx.Client) -> None:
     jid, part, epoch = task["job_id"], task["partition"], task["epoch"]
     merged: dict = {}
     for inp in task["inputs"]:
+        report_progress(client, jid, part, epoch, "reading",
+                        file_id=inp["file_id"], source=inp["worker_id"])
+        if FETCH_DELAY:
+            time.sleep(FETCH_DELAY)  # simulate a slow/blocked shard read
         text = None
         if inp["worker_id"] == WORKER_ID:
             try:
@@ -134,6 +157,7 @@ def do_reduce(task: dict, client: httpx.Client) -> None:
         for line in text.splitlines():
             if line:
                 merge_record(json.loads(line), merged)
+    report_progress(client, jid, part, epoch, "merging")
     if REDUCE_DELAY:
         # simulate merge work; also widens the window in which a mid-merge
         # kill invalidates this task, so the fencing path is exercised

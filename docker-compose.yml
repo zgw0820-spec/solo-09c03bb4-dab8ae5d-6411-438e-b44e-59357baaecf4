@@ -20,6 +20,7 @@ services:
       DATA_DIR: /data
       SHARD_DIR: /shards
       REDUCE_DELAY_MS: "500"
+      FETCH_DELAY_MS: "400"     # 模拟读取受阻，便于在任务页看到"正在读哪份分片"
     volumes:
       - appdata:/data
     tmpfs:
@@ -37,6 +38,7 @@ services:
       DATA_DIR: /data
       SHARD_DIR: /shards
       REDUCE_DELAY_MS: "500"
+      FETCH_DELAY_MS: "400"
     volumes:
       - appdata:/data
     tmpfs:

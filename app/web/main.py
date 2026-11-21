@@ -97,7 +97,8 @@ def _invalidate_reduces(job: dict) -> None:
         if not deps_lost:
             continue
         if rd["state"] == "ASSIGNED":
-            rd.update(state="PENDING", worker=None)
+            rd.update(state="PENDING", worker=None, progress=None,
+                      last_error=None)
             rd["epoch"] += 1
             log_event(job, f"reduce {p} INVALIDATED (read a lost shard before "
                            f"finishing); will re-run, its late commit will be rejected")
@@ -147,7 +148,8 @@ def on_worker_dead(wid: str, reason: str) -> None:
         for p in range(job["r"]):
             rd = job["reduces"][str(p)]
             if rd["state"] == "ASSIGNED" and rd["worker"] == wid:
-                rd.update(state="PENDING", worker=None)
+                rd.update(state="PENDING", worker=None, progress=None,
+                          last_error=None)
                 rd["epoch"] += 1
                 log_event(job, f"reduce {p} died with {wid}; re-enqueued")
         # its shards are lost: recompute them, invalidate surviving merges
@@ -218,7 +220,8 @@ def assign_task(wid: str):
                         "file_id": fid, "worker_id": s["worker"],
                         "url": f"{w['base_url']}/shard-files/{jid}/{fid}/part-{p}.jsonl",
                     })
-                rd.update(state="ASSIGNED", worker=wid, assigned=now())
+                rd.update(state="ASSIGNED", worker=wid, assigned=now(),
+                          progress=None, last_error=None)
                 tmp = os.path.join(MERGE_DIR, jid,
                                    f"part-{p}.epoch-{rd['epoch']}.tmp.json")
                 store.save()
@@ -334,7 +337,8 @@ def _create_job(file_ids) -> str:
                            "records": 0, "fails": 0} for fid in files},
             "shards": {},
             "reduces": {str(p): {"epoch": 1, "state": "PENDING", "worker": None,
-                                 "records": 0, "output": None}
+                                 "records": 0, "output": None,
+                                 "progress": None, "last_error": None}
                         for p in range(NPARTITIONS)},
             "events": [], "report": None, "done": False,
         }
@@ -358,6 +362,12 @@ def job_page(request: Request, jid: str):
         for s in job["shards"].values():
             if s["status"] == "OK":
                 shard_count[s["worker"]] = shard_count.get(s["worker"], 0) + 1
+        # files each pending partition is still waiting on (shard not OK yet)
+        waiting = {
+            p: [store.data["files"][fid]["name"] for fid in job["files"]
+                if job["shards"].get(shard_key(fid, p), {}).get("status") != "OK"]
+            for p, rd in job["reduces"].items() if rd["state"] == "PENDING"
+        }
         ctx = {
             "request": request, "job": job, "phase": job_phase(job),
             "files": store.data["files"], "workers": store.data["workers"],
@@ -367,6 +377,7 @@ def job_page(request: Request, jid: str):
             "reduces_done": sum(1 for r in job["reduces"].values()
                                 if r["state"] == "COMMITTED"),
             "reduces": sorted(job["reduces"].items(), key=lambda kv: int(kv[0])),
+            "waiting": waiting,
             "events": list(reversed(job["events"])),
         }
     return templates.TemplateResponse(request=request, name="job.html", context=ctx)
@@ -543,13 +554,57 @@ def reduce_commit(wid: str, body: ReduceCommit):
         final = os.path.join(MERGE_DIR, body.job_id, f"part-{body.partition}.json")
         os.makedirs(os.path.dirname(final), exist_ok=True)
         os.replace(body.tmp_path, final)
-        rd.update(state="COMMITTED", output=final, records=body.records)
+        rd.update(state="COMMITTED", output=final, records=body.records,
+                  progress=None, last_error=None)
         w["tasks_done"] += 1
         log_event(job, f"reduce {body.partition} committed by {wid} "
                        f"({body.records} requests)")
         maybe_complete(job)
         store.save()
     return {"ok": True}
+
+
+class ReduceProgress(BaseModel):
+    job_id: str
+    partition: int
+    epoch: int
+    boot_id: str
+    stage: str                      # "reading" | "merging"
+    file_id: str | None = None
+    source: str | None = None
+
+
+@app.post("/api/tasks/reduce-progress/{wid}")
+def reduce_progress(wid: str, body: ReduceProgress):
+    """Record reduce read-progress for the job page.
+
+    Fenced exactly like commits: only the worker the partition is currently
+    assigned to, in the current epoch, may move the progress pointer. Late
+    progress from an invalidated/reassigned attempt is ignored, so it can
+    never overwrite the new round's state; committed partitions always keep
+    showing "done". Progress is display-only and never gates the report.
+    """
+    with store.lock:
+        job = store.data["jobs"].get(body.job_id)
+        if not job:
+            raise HTTPException(404, "unknown job")
+        rd = job["reduces"].get(str(body.partition))
+        w = store.data["workers"].get(wid)
+        current = (rd is not None and w is not None
+                   and w["state"] == "ALIVE" and w.get("boot_id") == body.boot_id
+                   and rd["state"] == "ASSIGNED" and rd["worker"] == wid
+                   and rd["epoch"] == body.epoch)
+        if not current:
+            if rd is not None and rd["state"] != "COMMITTED":
+                log_event(job, f"ignored late progress for reduce "
+                               f"{body.partition} from {wid} (epoch "
+                               f"{body.epoch}, current {rd['epoch']})")
+                store.save()
+            return {"accepted": False}
+        rd["progress"] = {"stage": body.stage, "file_id": body.file_id,
+                          "source": body.source, "ts": iso()}
+        store.save()
+    return {"accepted": True}
 
 
 class TaskFail(BaseModel):
@@ -573,10 +628,23 @@ def task_fail(wid: str, body: TaskFail):
             rd = job["reduces"][str(body.partition)]
             if (rd["state"] == "ASSIGNED" and rd["worker"] == wid
                     and rd["epoch"] == body.epoch):
-                rd.update(state="PENDING", worker=None)
+                rd.update(state="PENDING", worker=None, progress=None)
                 rd["epoch"] += 1
+                # keep the failed file+source visible until the partition is
+                # retried (re-assigned) or this execution is invalidated
+                miss = body.missing or {}
+                rd["last_error"] = {
+                    "file_id": miss.get("file_id") or body.file_id,
+                    "source": miss.get("peer"),
+                    "reason": body.reason, "ts": iso()}
+                where = ""
+                if rd["last_error"]["file_id"]:
+                    fname = store.data["files"].get(
+                        rd["last_error"]["file_id"], {}).get("name", "?")
+                    where = (f" (was reading {fname}"
+                             f" from {rd['last_error']['source']})")
                 log_event(job, f"reduce {body.partition} failed on {wid} "
-                               f"({body.reason}); re-enqueued")
+                               f"({body.reason}){where}; re-enqueued")
         elif body.type == "map" and body.file_id:
             m = job["maps"][body.file_id]
             if (m["state"] == "ASSIGNED" and m["worker"] == wid
@@ -627,6 +695,12 @@ def job_status(jid: str):
                                  if s["status"] == "OK"),
                 "shards_lost": sum(1 for s in job["shards"].values()
                                    if s["status"] == "LOST"),
+                "reduce_waiting": {
+                    p: [store.data["files"][fid]["name"] for fid in job["files"]
+                        if job["shards"].get(shard_key(fid, p), {}).get("status")
+                        != "OK"]
+                    for p, rd in job["reduces"].items()
+                    if rd["state"] == "PENDING"},
                 "events": job["events"], "report": job["report"],
                 "workers": store.data["workers"]}
 

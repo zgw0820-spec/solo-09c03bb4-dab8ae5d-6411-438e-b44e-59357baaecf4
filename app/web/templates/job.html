@@ -61,12 +61,42 @@
 </div>
 
 <div class="card">
-  <h2>归并任务</h2>
+  <h2>归并任务（读取进度用于排查报告迟迟不出的原因）</h2>
   <table>
-    <tr><th>分区</th><th>状态</th><th>epoch</th><th>执行者</th><th>请求数</th></tr>
+    <tr><th>分区</th><th>状态</th><th>epoch</th><th>执行者</th><th>请求数</th>
+        <th>读取进度</th></tr>
     {% for p, rd in reduces %}
-    <tr><td>{{ p }}</td><td>{{ rd.state }}</td><td>{{ rd.epoch }}</td>
-        <td>{{ rd.worker or '' }}</td><td>{{ rd.records }}</td></tr>
+    {% set pr = rd.get('progress') %}
+    {% set err = rd.get('last_error') %}
+    <tr>
+      <td>{{ p }}</td><td>{{ rd.state }}</td><td>{{ rd.epoch }}</td>
+      <td>{{ rd.worker or '' }}</td><td>{{ rd.records }}</td>
+      <td>
+        {% if rd.state == 'COMMITTED' %}
+          完成
+        {% elif rd.state == 'ASSIGNED' %}
+          {% if pr is none %}
+            <span class="warn">暂时无法确认进度（{{ rd.worker }} 尚未上报，归并仍在进行）</span>
+          {% elif pr.stage == 'reading' %}
+            正在读 <b>{{ files[pr.file_id].name if pr.file_id in files else '?' }}</b>
+            的分片（由 <b>{{ pr.source }}</b> 提供）
+          {% elif pr.stage == 'merging' %}
+            分片已读齐，正在归并
+          {% endif %}
+        {% elif rd.state == 'PENDING' %}
+          {% if waiting.get(p) %}
+            等待分片生成：{{ waiting[p]|join('、') }}
+          {% else %}
+            待派发
+          {% endif %}
+        {% elif rd.state == 'READY' %}
+          分片已齐，待派发
+        {% endif %}
+        {% if err %}
+          <div class="err">上次读取失败：{% if err.file_id and err.file_id in files %}{{ files[err.file_id].name }} {% endif %}{% if err.source %}（由 {{ err.source }} 提供）{% endif %}{{ err.reason }}</div>
+        {% endif %}
+      </td>
+    </tr>
     {% endfor %}
   </table>
 </div>
